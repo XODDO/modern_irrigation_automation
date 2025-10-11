@@ -392,6 +392,7 @@ void VeryFastTask(void * pvParams) {
   }
 
 }
+ float simulated_soil_moisture = 25.0; // Starting value
 
 float soilPercent = 0.00f;  
 uint64_t sends = 0; // 0 TO 4BILLION
@@ -401,7 +402,7 @@ const char sensor_position[10] = "Sensor A1";
 bool prepareJSONfile(char* out_buf, size_t out_size, size_t &len) {
     JSON_data.clear();
     JSON_data["Pos_1"]  = sensor_position; // string
-    JSON_data["Moi_1"]  = soilPercent; // keep as float // hopefully at 2dp
+    JSON_data["Moi_1"]  = soilPercent<1.0?simulated_soil_moisture:soilPercent; // keep as float // hopefully at 2dp
     JSON_data["Volt_1"]  = batt.getVoltage(); // float
     JSON_data["PwrMde_1"] = batt.getLevel(); // or string of current power 
     JSON_data["Sends_1"]    = sends; // very long integer
@@ -814,7 +815,6 @@ void sleep_dynamically() {
   but the Wi-Fi and ESP-NOW states are lost.
   So you must reinitialize radio after wake.*/
  
- float simulated_soil_moisture = 25.0; // Starting value
 
 float get_simulated_moisture() {
     // Add small random changes (-2% to +2%)
