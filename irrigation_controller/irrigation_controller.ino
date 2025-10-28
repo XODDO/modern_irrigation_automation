@@ -109,7 +109,7 @@ OperationMode currentMode = OperationMode::ESP_NOW;
 bool otaModeActive = false;
 bool wifi_connected = false;
 uint64_t otaStartTime = 0;
-const uint64_t OTA_TIMEOUT = 5ULL * 60ULL * 1000ULL;  // 5 minutes
+const uint64_t OTA_TIMEOUT = 10ULL * 60ULL * 1000ULL;  // 10 minutes
 uint64_t last_check = 0;
 char LastOTAUpdate[60] = "27 Oct 2025 10:10";
 
@@ -215,15 +215,15 @@ char sensor_2_time_stamps[30][32] = {"10:10", "10:11", "10:12", "10:13"};
 
 void send_to_wifi_core();
 
-uint8_t wifi_led     = 25;
-uint8_t ota_button   = 2;
-uint8_t heartbeatLED = 27;
+const uint8_t wifi_led     = 25;
+const uint8_t ota_button   = 2;
+const uint8_t heartbeatLED = 27;
 
-uint8_t active_sensors = 0;
 const uint8_t sensor_1_active_pin = 33; // problems with this pin?
 const uint8_t sensor_2_active_pin = 26;
 const int irrigation_valve_pin = 12; // GPIO pin controlling the irrigation valve
 const int water_flow_sensor_pin = 39; // VN pin for the flow sensor
+uint8_t active_sensors = 0;
 
 Buzzer buzzer(14);   //uint8_t buzzer = 14;     // buzzer pin
 Battery batt(36, 14.40, 1);         // V+ pin, scaling factor, num batteries
@@ -245,11 +245,13 @@ volatile bool otaStarted = false;
 volatile bool otaError = false;
 
 
-void setup() {
+void setup() { delay(500); // for OTAs to settle
       Serial.begin(115200); delay(500); Serial.println(); Serial.printf("------Firmware %s booting...\n", FW_VERSION);
       Serial2.begin(115200, SERIAL_8N1, 16, 17);
       buzzer.begin(); // comes with pinMode(buzzer, OUTPUT);
          
+      // Serial.print("Ready for OTA at IP: ");Serial.println(WiFi.localIP());
+
   // CORE TASK 1
       xTaskCreatePinnedToCore(VeryFastTask, "BuzzingCheck", 2048, NULL, PRIORITY_HIGH, NULL, 1);
       Serial.println("\tBuzzer Task initialized!");
@@ -375,7 +377,7 @@ char irrigation_stop_time_str[32] = "10:10:55";
 void irrigate(float average_reading, float BatteryVoltage, uint64_t time_now_us){
   bool should_irrigate = false;
   irrigation_status_log[0] = '\0';
-/*
+
   if (BatteryVoltage < 10.5) { // low battery guard
       if(is_irrigating){
           digitalWrite(irrigation_valve_pin, LOW); // Close valve
@@ -384,8 +386,8 @@ void irrigate(float average_reading, float BatteryVoltage, uint64_t time_now_us)
         }
         return;
     }
-    */
-/*
+    
+
     if (irrigation_cycles_today > max_irrigation_cycles_per_day) { // daily limit guard
         if(is_irrigating){
           digitalWrite(irrigation_valve_pin, LOW); // Close valve
@@ -401,7 +403,7 @@ void irrigate(float average_reading, float BatteryVoltage, uint64_t time_now_us)
         return;
     }
 
-    */
+    
 
     
     if (strcmp(SystemDate, last_irrigation_date) != 0) { // new day reset
@@ -410,7 +412,7 @@ void irrigate(float average_reading, float BatteryVoltage, uint64_t time_now_us)
     }
 
 
-  if(average_reading < 5.0){ // impossibly low
+  if(average_reading < 3.0){ // impossibly low
     if(is_irrigating){
           digitalWrite(irrigation_valve_pin, LOW); // Close valve
           is_irrigating = false;
@@ -975,7 +977,7 @@ void initializeOTA() {
         else if (error == OTA_END_ERROR)
           strcat(ota_log, "End Failed");
       });
-
+  delay(5);
   ArduinoOTA.begin();
   strcpy(ota_log, "OTA Ready!");
   Serial.println(ota_log);
@@ -1654,7 +1656,7 @@ void footer(){
             
             //BATTERY
             LCD.fillRect(272, 282, 3, 6, GxEPD_WHITE); LCD.fillRoundRect(275, 277, 35, 16, 3, GxEPD_WHITE); 
-            if(SystemBatteryVoltage >= 6.00) { LCD.setFont(); LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);  LCD.setCursor(272, 281); LCD.print("voltage_string");  }
+            if(SystemBatteryVoltage >= 6.00) { LCD.setFont(); LCD.setTextColor(LCD.epd2.hasColor ? GxEPD_RED : GxEPD_BLACK);  LCD.setCursor(272, 281); LCD.print(batt.getVoltage());  }
        
             //SEPARATOR
            // LCD.fillRect(295, 275, 7, 20, GxEPD_WHITE);
