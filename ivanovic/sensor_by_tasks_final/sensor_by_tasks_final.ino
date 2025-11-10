@@ -53,7 +53,7 @@ uint8_t indicator = 2;
 
 //sensor etc
 uint8_t sensorPin = 36;
-uint8_t sensorRelay = 33;
+uint8_t sensorRelay = 2;
 uint8_t solarPin = 16;  // for waking up from deep slumber  //uint8_t batteryPin = 35;
 
 // base class GxEPD2_GFX can be used to pass references or pointers to the display instance as parameter, uses ~1.2k more code
@@ -89,10 +89,9 @@ void init_send_system();
 void update_display();
 void soilMoi_Screen();
 void dataUpload_Screen();
+void Power_Wifi_Screen();
 void LowPower_Screen();
 void BootScreen();
-
-
 
 
 // Esp-Now Call Back
@@ -101,8 +100,7 @@ void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status);
 // work horses
 void sense_reading();
 float soil_moisture_calibrator(uint16_t working_reading);
-
-      
+     
 void initialize_indicators();
 bool initializeWirelessCommunication();
 void manage_wireless_mode();
@@ -200,9 +198,7 @@ void setup(){  // to let the serial connection open fully.
       if(current_power == POWER_CRITICAL) { // if power is infinitely low beep low power, 
         //batt.onLow(beepLowBattery);
           Serial.println("!!!SETUP FOUND POWER TOO LOW");
-          btStop();
-         // adc_power_off(); // optional depending on ESP32 model
-
+          
           LowPower_Screen(); LCD.hibernate(); vTaskDelay(pdMS_TO_TICKS(500)); // present voltage and low power prompt
           // currentScreen = -1; 
           // update_display();
@@ -221,7 +217,7 @@ void setup(){  // to let the serial connection open fully.
 
      //THE KEY COMPONENT
       pinMode(sensorPin, INPUT);  Serial.println("Sensor initialized!"); vTaskDelay(pdMS_TO_TICKS(1000)); // give sensor some starting current
-      pinMode(sensorRelay, OUTPUT); digitalWrite(sensorRelay, HIGH); Serial.println("Sensor Relay Toggled!");
+      pinMode(sensorRelay, OUTPUT); digitalWrite(sensorRelay, LOW); Serial.println("Sensor Relay Toggled!");
       pinMode(solarPin, INPUT); // TO READ SUNSHINE
 
           // Initialize wireless communication with retry logic
@@ -241,7 +237,7 @@ void setup(){  // to let the serial connection open fully.
           vTaskDelay(pdMS_TO_TICKS(5000)); currentScreen = 1;
 
 
-          digitalWrite(sensorRelay, LOW);
+          digitalWrite(sensorRelay, HIGH);
           buzzer.beep(2, 50, 50); 
 
 
@@ -398,14 +394,15 @@ float soilPercent = 0.00f;
 uint64_t sends = 0; // 0 TO 4BILLION
 
 // Data gonna be like = {SensorID1:"SensorA1", "Moisture1":25.87, Temperature1:32.87, Voltage: 8.2, Sends:256718};
-const char sensor_position[10] = "Sensor A1";
+const char sensor_position[10] = "Sensor A2";
 bool prepareJSONfile(char* out_buf, size_t out_size, size_t &len) {
     JSON_data.clear();
-    JSON_data["Pos_1"]  = sensor_position; // string
-    JSON_data["Moi_1"]  = soilPercent<1.0?simulated_soil_moisture:soilPercent; // keep as float // hopefully at 2dp
-    JSON_data["Volt_1"]  = batt.getVoltage(); // float
-    JSON_data["PwrMde_1"] = batt.getLevel(); // or string of current power 
-    JSON_data["Sends_1"]    = sends; // very long integer
+    JSON_data["Pos_2"]  = sensor_position; // string
+   // JSON_data["Moi_2"]  = soilPercent<1.0?simulated_soil_moisture:soilPercent; // keep as float // hopefully at 2dp
+    JSON_data["Moi_2"]  = soilPercent; // keep as float // hopefully at 1-2dp
+    JSON_data["Volt_2"]  = batt.getVoltage(); // float
+    JSON_data["PwrMde_2"] = batt.getLevel(); // or string of current power 
+    JSON_data["Sends_2"]    = sends; // very long integer of successful deliveries
 
    if(out_size < 200) return false; // Minimum safe size
 
@@ -537,15 +534,15 @@ void CombinedTasks(void *pvParams) { // the 4 in one
 }
 
 
-char time_str[12];
-
+char time_str[16];
+uint8_t hours = 0;
 uint64_t now_now = 0, prev = 0;
 void loop() {
   // everything is handled by the scheduler in TASKS
 
   if((esp_timer_get_time() - now_now) >= 1e7){ // blink e.g. every 10 second // heart beat
         uint64_t seconds = now_now / 1000000ULL;
-        uint8_t hours   = (seconds / 3600) % 24;
+         hours   += (seconds / 3600) % 24;
         uint8_t minutes = (seconds % 3600) / 60;
         uint8_t secs    = 1+(seconds % 60);
 
@@ -644,7 +641,6 @@ char SleepPrompt[200];
 void sleep_dynamically() {
     switch (current_power) {
         case POWER_CRITICAL: { // 2 hours
-              currentScreen = -1;  // for UI
               dynamic_interval = power_critical_sleep_duration;
 
               Serial.println("\n=== ENTERING CRITICAL POWER MODE ===");
@@ -652,43 +648,113 @@ void sleep_dynamically() {
                             dynamic_interval / 1e6, dynamic_interval / 6e7);
 
               // --- 1. Graceful shutdown sequence ---
+              btStop();
+
+          
+         // adc_power_off(); // optional depending on ESP32 model
 
               // Stop high-current peripherals
-              digitalWrite(sensorRelay, LOW);
+               // --- 1. Immediate peripheral shutdown ---
+              digitalWrite(sensorRelay, HIGH);      // turn off sensor power
+              digitalWrite(low, LOW);
+              digitalWrite(medium, LOW);
+              digitalWrite(high, LOW);
               buzzer.stop();  // Ensure no tone active
+              
+              currentScreen = -1;  // update_display(); for UI
               LowPower_Screen(); // mid operation shut down
               LCD.hibernate();
+              delay(100); // ensure SPI transactions complete
               
-              // Disable WiFi / ESP-NOW cleanly
-              if (can_send_wirelessly) {
-                  esp_now_deinit();
-                  can_send_wirelessly = false;
-              }
+              //  // --- 2. Networking teardown (WiFi / ESP-NOW) ---
+            if (can_send_wirelessly) {
+                esp_err_t e = esp_now_deinit();
+                Serial.printf("esp_now_deinit() -> %d\n", e);
+      /*
+                  if(!esp_now_deinit(){
+                    Serial.println("ESP-NOW powering OFF Failed!");
+                  }
 
-              WiFi.disconnect(true);
-              WiFi.mode(WIFI_OFF);
-              esp_wifi_stop();
+                  else {
+          */
+                    can_send_wirelessly = false;
+                    Serial.println("ESP-NOW powered OFF");
 
-              // Optional: power down ADC if supported
+                 // stop WiFi fully
+                if (esp_wifi_stop() == ESP_OK) Serial.println("esp_wifi_stop OK");
+                if (esp_wifi_deinit() == ESP_OK) Serial.println("esp_wifi_deinit OK");
+
+                WiFi.disconnect(true);
+                WiFi.mode(WIFI_OFF);
+
+                Serial.println("WiFi Powered down!");
+            }
+              //esp_wifi_stop(); alone can leave some chip subsystems powered
+
+                    // Optional: power down ADC if supported
               // adc_power_off();  // (commented because ESP32-S3 deprecated this)
 
-              // Give Serial a moment to flush
-              Serial.flush();
-              vTaskDelay(pdMS_TO_TICKS(100));
+                    Serial.flush();  // Give Serial a moment to flush
+                    vTaskDelay(pdMS_TO_TICKS(100));
+      /*
+                    // --- 3. Bluetooth teardown (if BT may be enabled) ---
+                    // Use guarded calls; some IDFs require checking if BT is enabled
+                    #if defined(CONFIG_BT_ENABLED) || defined(CONFIG_BLUEDROID_ENABLED)
+                      // Try to safely disable blueooth controller & stack
+                      esp_err_t bt_err = ESP_OK;
+                      if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+                          esp_bluedroid_disable();
+                          esp_bluedroid_deinit();
+                      }
+                      if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+                          esp_bt_controller_disable();
+                          esp_bt_controller_deinit();
+                      }
+                      Serial.printf("Bluetooth shutdown: %d\n", bt_err);
+                    #else
+                      Serial.println("Bluetooth not enabled in build.");
+                    #endif
+        */
+                     // Print debug info: reset reason and wake cause
+                  esp_reset_reason_t rr = esp_reset_reason();
+                  Serial.printf("Reset reason before sleep: %d\n", rr);
+                  esp_sleep_wakeup_cause_t wck = esp_sleep_get_wakeup_cause();
+                  Serial.printf("Wake cause before sleep: %d\n", wck);
 
-              // --- 2. Prepare deep sleep ---
-              esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL); // clean slate
-              esp_sleep_enable_timer_wakeup(dynamic_interval);
-            //  esp_sleep_enable_ext0_wakeup(solarPin, 1); // wake on HIGH
+                  // --- 5. Configure wake sources cleanly ---
+                  // disable previously enabled wake sources first
+                  /*
+                  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+                  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+                  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+                  */
+                  // or
+                  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
-              Serial.println("→ Entering deep sleep now...");
-              Serial.println("Expected wake in ~2 hours.");
+                  // Enable single intentional wake source: timer (and optional ext0 for solarPin HIGH)
+                  esp_sleep_enable_timer_wakeup(dynamic_interval);
+                  // If you want to also allow solarPin to wake when it goes HIGH (e.g., sunrise),
+                  // ensure solarPin is RTC-capable and uncomment:
+                  // esp_sleep_enable_ext0_wakeup((gpio_num_t)solarPin, 1); // wake on HIGH
+
+                    Serial.println("→ Entering deep sleep now...");
+                    Serial.println("Expected wake in ~2 hours.");
+
+                                        
+                    Serial.flush();
+                    vTaskDelay(pdMS_TO_TICKS(100));
 
               // --- 3. Enter deep sleep ---
-              esp_deep_sleep_start();
+                    esp_deep_sleep_start();
 
-              // Code never reaches here but break the case nonetheless
-              break;
+                     // Should never reach here
+                      Serial.println("ERROR: deep sleep failed to start!");
+
+                // }
+
+            //  }
+                            // Code never reaches here but break the case nonetheless
+                            break;
         }
 
         case  POWER_LOW: { // 15 mins
@@ -710,6 +776,7 @@ void sleep_dynamically() {
               Serial.println("→ Sleeping...");
               esp_light_sleep_start();
 
+             
               // Upon waking
               esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
               Serial.printf("Woke up (cause=%d). Reinitializing radio...\n", wakeCause);
@@ -830,7 +897,8 @@ float get_simulated_moisture() {
 // GLOBAL VARIABLES TO BE USED by 3 functions: sense_reading, update_display and send_as_JSON
 
 // soil specific constants
-const uint8_t wiltingPt = 19;    const uint8_t fieldCapacity = 40; // for 100% 
+const float wiltingPoint = 19.0;    
+const float fieldCapacity = 60.0; // THE WETTEST SOIL  
 
 /*
  * @brief Reads soil moisture sensor 100 times and averages result.
@@ -840,7 +908,7 @@ void sense_reading(){
 
      Serial.println("Now Scanning the Soil..."); Serial.println();
      flash_indicators();
-     digitalWrite(sensorRelay, HIGH); 
+     digitalWrite(sensorRelay, LOW); 
     vTaskDelay(pdMS_TO_TICKS(250));     //when powering sensorRelay set a small settle delay (e.g., 50–200 ms) before sampling.
  
       //char last_recording_time[12] = "21:45:00";    
@@ -897,7 +965,7 @@ void sense_reading(){
 
           update_indicators(soilPercent);    
 
-     digitalWrite(sensorRelay, LOW); buzzer.beep(1,50,0); // TO SIGNIFY END OF READING
+     digitalWrite(sensorRelay, HIGH); buzzer.beep(1,50,0); // TO SIGNIFY END OF READING
 
      Serial.print("Reading Duration: ");    Serial.print(readings_duration, 4); Serial.println(" milliseconds");
 
@@ -922,8 +990,8 @@ float soil_moisture_calibrator(uint16_t working_reading){ Serial.println("Runnin
 
       float refined_val = (float)working_reading; Serial.print("Computed Average: "); Serial.println(working_reading);
             refined_val = refined_val / float(reading_range); Serial.print("Semi Refined:"); Serial.println(refined_val); // min => 5, max => 4000
-        if(refined_val <= 0.90)  { refined_val = refined_val * fieldCapacity; } //making 40 to be the highest possible reading ... 
-      else refined_val = refined_val * 100.0; //showing the 100%
+        if(refined_val <= 0.80)  { refined_val = refined_val * fieldCapacity; } //making 40 to be the highest possible reading ... 
+      else refined_val = refined_val * 100.0; //showing the 100% if in air
           
      return refined_val;
 }
@@ -935,7 +1003,7 @@ void flash_indicators(){
 }
 
 void update_indicators(float soilMoisture_val){
-       if(soilMoisture_val <= 15.0){
+       if(soilMoisture_val <= wiltingPoint){
 
          digitalWrite(low, HIGH);   vTaskDelay(pdMS_TO_TICKS(10));
          digitalWrite(medium, LOW); vTaskDelay(pdMS_TO_TICKS(10));
@@ -943,7 +1011,7 @@ void update_indicators(float soilMoisture_val){
     
        }
 
-       else if(soilMoisture_val <= 25.0){ // if 15 - 25
+       else if(soilMoisture_val <= 25.0){ // if 20 - 25
          digitalWrite(low, LOW);    vTaskDelay(pdMS_TO_TICKS(10));
          digitalWrite(medium, HIGH);vTaskDelay(pdMS_TO_TICKS(10));
          digitalWrite(high, LOW);   vTaskDelay(pdMS_TO_TICKS(10));
@@ -1068,14 +1136,14 @@ void LowPower_Screen(){
     //LCD.fillCircle(100, 40, 25, GxEPD_BLACK);
     //LCD.fillCircle(100, 40, 18, GxEPD_WHITE);
 
-    LCD.setFont(&FreeSans9pt7b);
-    LCD.setCursor(40, 190); 
-    LCD.printf("Waking in %.1f hr", power_critical_sleep_duration / 3.6e9);
+    //
+    //LCD.setCursor(40, 190); 
+    //LCD.printf("Waking in %.1f hr", power_critical_sleep_duration / 3.6e9);
 
 
         //BATTERY
-    LCD.fillRoundRect(50, 144, 88, 40, 5, GxEPD_BLACK); LCD.fillRoundRect(54, 148, 80, 32, 5, GxEPD_WHITE); LCD.fillRect(45, 155, 5, 20, GxEPD_BLACK);  
-    LCD.setCursor(60, 175); LCD.print(batt.getVoltage()); 
+    LCD.fillRoundRect(50, 144, 88, 40, 5, GxEPD_BLACK); LCD.fillRoundRect(54, 148, 80, 32, 5, GxEPD_WHITE); LCD.fillRoundRect((54+81), 155, 8, 20,2, GxEPD_BLACK);  
+    LCD.setFont(&FreeSans9pt7b); LCD.setCursor(80, 168); LCD.print(batt.getVoltage()); 
     
   } while (LCD.nextPage());
 
@@ -1118,7 +1186,7 @@ void drawLargeBatteryIcon(int x, int y, float voltage) {
     LCD.fillRoundRect(x, y, 88, 40, 5, GxEPD_BLACK);
 
     // Positive terminal
-    LCD.fillRect(x - 5, y + 10, 5, 20, GxEPD_BLACK);
+    LCD.fillRect((x+86), y + 10, 5, 20, GxEPD_BLACK);
 
     // Inner white background
     LCD.fillRoundRect(x + 4, y + 4, 80, 32, 4, GxEPD_WHITE);
@@ -1240,9 +1308,12 @@ void soilMoi_Screen(){
  
       char soil_moisture_char[7] = "x.x";
 
+    /*
       //print only whole numbers on screen
       if(soilPercent <= 1.0) itoa((int)(simulated_soil_moisture+0.5), soil_moisture_char, 10);  // remove on deployment
       else itoa((int)(soilPercent+0.5), soil_moisture_char, 10); // strcat(last_soil_moisture, "%");
+    */
+      itoa((int)(soilPercent+0.5), soil_moisture_char, 10); 
 
   LCD.firstPage();
   do {
