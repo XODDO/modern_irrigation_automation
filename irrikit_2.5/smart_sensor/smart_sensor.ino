@@ -1,20 +1,17 @@
-/* XODDOCODE 2026
-  * IRRIKIT SOIL SENSING NODE
-  * 25 APRIL 2026
+/*   XODDOCODE 2026
+  *  IRRIKIT SOIL SENSING NODE
+  *  15 MAY 2026
 */
 #include <Arduino.h>
 #include "globals.h" // all other directives and declarations
 
-#define FW_VERSION "v1.3.2-ESP32-SoilNode"
-
-
 const char SensorID[12] = "Wakiso_1"; 
 const char sensor_position[10] = "BLK 1";
+const char FW_VERSION[8] = "v1.3.2";
 
 OTA_Credentials get;
 const char* OTA_PASS = get.secure_ota_password;
 
-float soil_moisture_percent = 0.0f;
 
 
 typedef struct sensorData{ // all stringified
@@ -38,6 +35,7 @@ Battery batt(batteryPin, single_cell_max_voltage, number_of_cells);         // p
 WiFi_Manager wifi_obj(27); // pin 27
 sense sensor;
 
+float soil_moisture_percent = 0.0f;
 
 // base class GxEPD2_GFX can be used to pass references or pointers to the display instance as parameter, uses ~1.2k more code
 // enable or disable GxEPD2_GFX base class
