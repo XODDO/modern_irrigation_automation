@@ -8,7 +8,7 @@
 #define FW_VERSION "v1.3.2-ESP32-SoilNode"
 
 
-const char SensorID[15] = "Hoima_Node_2"; 
+const char SensorID[12] = "Wakiso_1"; 
 const char sensor_position[10] = "BLK 1";
 
 OTA_Credentials get;
@@ -18,15 +18,20 @@ float soil_moisture_percent = 0.0f;
 
 
 typedef struct sensorData{ // all stringified
-      char sendable_data_bundle[240] = "";
+      char sendable_data_pack[247] = "";
    }  sensorData; 
 
 sensorData senderObj;
 
+typedef struct sensorMemory{
+    char sendable_memo[247] = ""; // 3B less than max payload
+}sensorMemory;
+sensorMemory memObj;
+
 
 
 // Static JSON document (internal to this compilation unit)
-static StaticJsonDocument<240> JSON_data; //<250B the largest payload to be carried at once by espnow
+static StaticJsonDocument<245> JSON_data; //<250B the largest payload to be carried at once by espnow
 
 Buzzer buzzer(buzzingPin);   //uint8_t buzzer = 14;     // buzzer pin
 Battery batt(batteryPin, single_cell_max_voltage, number_of_cells);         // pin, scaling factor, num batteries
@@ -44,23 +49,27 @@ sense sensor;
 // GxEPD2_3C<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> LCD(GxEPD2_154_D67(/*CS=*/5, /*DC=*/4, /*RES=*/13, /*BUSY=*/15)); // GDEW0154Z17 200x200, SSD1681
 // ESP32 CS(SS)=5,SCL(SCK)=18,SDA(MOSI)=23,BUSY=15,RES(RST)=2,DC=0
 
-const size_t MIN_STACK_SAFETY_MARGIN = 200;
+//Rule of thumb: If watermark drops below ~512 bytes, you're in danger. Below 20 is critical.
+const size_t MIN_STACK_SAFETY_MARGIN = 512;
+const size_t CRITICAL_STACK_SAFETY_MARGIN = 200;
 
-const uint32_t  SENSING_TASK_STACK_SIZE = 12288; // 12kB
-const uint32_t  OTA_TASK_STACK_SIZE  = 4096; // 4kB
-const uint32_t  BUZZING_TASK_STACK_SIZE= 4096; // 4kB
-const uint32_t  OTA_BTN_STACK_SIZE = 4096;  // 4kB
+const uint32_t  SENSING_TASK_STACK_SIZE  = 12288; // 12kB
+const uint32_t  OTA_TASK_STACK_SIZE      = 8192; // 8kB because WiFi stack activity, TCP, buffers, flash writes, callbacks
+const uint32_t  BUZZING_TASK_STACK_SIZE  = 4096; // 4kB
+const uint32_t  OTA_BTN_STACK_SIZE       = 4096;  // 4kB
+const uint32_t  MEMORY_TASK_STACK_SIZE   = 4096;
 
-uint8_t SENSING_TASK_CORE = 0;
-uint8_t OTA_SERVICE_TASK_CORE  =  0;
-uint8_t OTA_BTN_TASK_CORE = 1;
-uint8_t BUZZING_TASK_CORE = 1;
+const uint8_t SENSING_TASK_CORE = 0;
+const uint8_t OTA_SERVICE_TASK_CORE  =  0;
+const uint8_t OTA_BTN_TASK_CORE = 1;
+const uint8_t BUZZING_TASK_CORE = 1;
+const uint8_t MEMORY_TASK_CORE  = 1;
 
-#define BUZZING_TASK_PRIORITY 4 // so that the buzzer is not kept waiting for LCD/send/heavy Serial
-#define OTA_TASK_PRIORITY     3
-#define OTA_BTN_PRIORITY      2
-#define SENSING_TASK_PRIORITY 1
-
+#define BUZZING_TASK_PRIORITY 5 // so that the buzzer is not kept waiting for LCD/send/heavy Serial
+#define OTA_TASK_PRIORITY     4
+#define OTA_BTN_PRIORITY      3
+#define SENSING_TASK_PRIORITY 2
+#define MEMORY_TASK_PRIORITY  1 
 
 TaskHandle_t buzzingTaskHandle = NULL;
 TaskHandle_t otaTaskHandle = NULL;
@@ -77,6 +86,8 @@ void Read_display_send_task(void *pvParams);
 void OtaButtonTask(void *pvParameters);
 void BuzzingTask(void * pvParams);
 void OtaServiceTask(void *pv);
+void MemoryMonitorTask(void *pv);
+
 
 void handle_ota_exit_conditions(uint64_t running_time);
 void process_ota_state_transitions(uint64_t running_time);
@@ -113,11 +124,19 @@ uint8_t drop_index = 0;
 float avg_voltage_drop = 0;
 
 
-moistureData senderObject;
 
 int8_t currentScreen = -1; // negative for very low power
 
 bool battery_low_registered = false;
+
+// Track reset history (store in RTC memory to survive resets)
+RTC_DATA_ATTR uint32_t boot_count = 0;
+
+RTC_DATA_ATTR uint32_t reset_count = 0;
+RTC_DATA_ATTR uint32_t last_reset_reason = 0;
+RTC_DATA_ATTR uint64_t last_reset_time_us = 0;
+RTC_DATA_ATTR char last_reset_time_str[32] = "Never";
+
 
 
 char soil_moisture_char[8] = "x.x";
@@ -214,6 +233,11 @@ void setup(){    // The principle: nothing that draws current should run until c
     Serial.println("!!!SETUP FOUND POWER SUFFICIENT");
     Serial.flush();
     delay(100);
+    log_boot_to_flash();
+
+    // Function to update reset tracking (call this at startup)
+    update_reset_tracking();
+
     
     // CRITICAL: Proper frequency change with UART reinit
     Serial.end();  // Stop UART completely
@@ -250,7 +274,17 @@ void setup(){    // The principle: nothing that draws current should run until c
     Serial.println(">>>SETUP FOUND POWER HIGH ENOUGH");
     Serial.flush();
     
+    
+        Serial.printf("  - Free heap before any task: %u bytes\n", esp_get_free_heap_size());
+        Serial.printf("  - Minimum free heap: %u bytes\n", esp_get_minimum_free_heap_size());
+        Serial.printf("Heap on entry: free=%u, largest=%u\n",
+                    esp_get_free_heap_size(),
+                    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
+        Serial.printf("  - Largest free block after all tasks: %u bytes\n",
+                        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        
+      delay(100);
     // NOW START SPINNING TASKS AND ACTIVATE GPIOz
        buzzer.begin(); // comes with pinMode(buzzer, OUTPUT);
          
@@ -260,17 +294,16 @@ void setup(){    // The principle: nothing that draws current should run until c
       
       buzzer.beep(1,50,0); // now this can go off in exactly 50ms before the loop comes in
 
-     batt.onLow(beepLowBattery);
-     batt.onRecovered(BatteryRecovered);
+      batt.onLow(beepLowBattery);
+      batt.onRecovered(BatteryRecovered);
 
-     xTaskCreatePinnedToCore(OtaButtonTask,  "OTA_Button", OTA_BTN_STACK_SIZE,   NULL,   OTA_BTN_PRIORITY,   &otaBtnHandle,  OTA_BTN_TASK_CORE); // polls every 100ms
+      Serial.println("Initializing Sensor...");
+      sensor.begin(sensorPin, sensorRelay);
+      sensor.initialize_indicators(lowPin, mediumPin, highPin);
+      Serial.println("Sensor Initialized!");
 
-     Serial.println("Initializing Sensor");
-     sensor.begin(sensorPin, sensorRelay);
-     sensor.initialize_indicators(lowPin, mediumPin, highPin);
-
-     Serial.println("Initializing display");
-     LCD.init(115200, true, 50, false); vTaskDelay(pdMS_TO_TICKS(1000)); // for the hardware SPI to connect to start transactions
+      Serial.println("Initializing Display...");
+      LCD.init(115200, true, 50, false); vTaskDelay(pdMS_TO_TICKS(1000)); // for the hardware SPI to connect to start transactions
 
 
      BootScreen(); LCD.hibernate(); vTaskDelay(pdMS_TO_TICKS(1000));
@@ -303,7 +336,26 @@ void setup(){    // The principle: nothing that draws current should run until c
     xDataMutex = xSemaphoreCreateMutex();
     sendSemaphore = xSemaphoreCreateBinary();  // Binary semaphore for send completion
     serialMutex = xSemaphoreCreateMutex(); // for serial protection
-    
+    otaMutex = xSemaphoreCreateMutex(); // Create mutex for OTA coordination
+
+    if(xDataMutex){
+        Serial.println("Data Mutex Created Successfully!");
+    } else if(otaMutex == NULL) Serial.println("Failed to create DATA MUTEX!");
+
+    if(sendSemaphore){
+                Serial.println("Send Semaphore Created Successfully!");
+
+    } else if(otaMutex == NULL) Serial.println("Failed to create SEND SEMAPHORE!");
+
+    if(serialMutex){
+                Serial.println("Serial Mutex Created Successfully!");
+
+    } else if(otaMutex == NULL) Serial.println("Failed to create SERIAL MUTEX!");
+
+    if(otaMutex){
+                Serial.println("OTA Mutex Created Successfully!");
+
+    } else if(otaMutex == NULL) Serial.println("Failed to create OTA MUTEX!");
 
     if (xDataMutex == NULL || sendSemaphore == NULL) {
         Serial.println("Failed to create mutex/semaphore!");
@@ -312,14 +364,8 @@ void setup(){    // The principle: nothing that draws current should run until c
 
 
 
-   //  CORE TASK 2
+   //  CORE TASK 
     
-    Serial.printf("  - Free heap before task: %u bytes\n", esp_get_free_heap_size());
-    Serial.printf("  - Minimum free heap: %u bytes\n", esp_get_minimum_free_heap_size());
-     Serial.printf("Heap on entry: free=%u, largest=%u\n",
-                  esp_get_free_heap_size(),
-                  heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
     // Create sensing task with handle
     BaseType_t result_task = xTaskCreatePinnedToCore(
                 Read_display_send_task, 
@@ -332,7 +378,7 @@ void setup(){    // The principle: nothing that draws current should run until c
             );
     
     if (result_task != pdPASS) {
-        Serial.printf("ERROR: Failed to create task! Reason: %d\n", result_task);
+        Serial.printf("ERROR: Failed to create SENSING task! Reason: %d\n", result_task);
         
         switch(result_task) {
             case errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY:
@@ -347,13 +393,17 @@ void setup(){    // The principle: nothing that draws current should run until c
      //   return false;
     }
     
-    Serial.println("  - Task created successfully");
+    Serial.println(" Read_display_send_task  - Task created successfully");
     Serial.printf("  - Free heap after task: %u bytes\n", esp_get_free_heap_size());
     
 
     delay(2000);
+    pinMode(ota_button, INPUT_PULLUP);
+   
 
-            otaMutex = xSemaphoreCreateMutex(); // Create mutex for OTA coordination
+    // button task
+        
+      xTaskCreatePinnedToCore(OtaButtonTask,  "OTA_Button", OTA_BTN_STACK_SIZE,   NULL,   OTA_BTN_PRIORITY,   &otaBtnHandle,  OTA_BTN_TASK_CORE); // polls every 100ms
 
 
         Serial.println("\n=== Creating OTA Service Task ===");
@@ -367,6 +417,7 @@ void setup(){    // The principle: nothing that draws current should run until c
         Serial.printf("  - Largest free block: %u bytes\n",
                     heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
+    // ota service task
         BaseType_t ota_result = xTaskCreatePinnedToCore(
             OtaServiceTask,
             "OTA_Service",
@@ -399,21 +450,43 @@ void setup(){    // The principle: nothing that draws current should run until c
         {
             Serial.println("  - OTA task created successfully");
 
-            Serial.printf("  - Free heap after task: %u bytes\n",
+          
+        }
+
+        delay(500);
+        BaseType_t mem_result =     xTaskCreatePinnedToCore(
+                                        MemoryMonitorTask,  
+                                        "Continuous MemoryMonitoring", 
+                                        MEMORY_TASK_STACK_SIZE,   
+                                        NULL,   
+                                        MEMORY_TASK_PRIORITY,   
+                                        NULL,  
+                                        MEMORY_TASK_CORE
+                                    ); 
+
+         if (mem_result != pdPASS)
+        {
+            Serial.printf("ERROR: Failed to create MEMORY TRACKER task! Reason: %d\n",
+                        mem_result);
+        }
+        else    Serial.println("Memory Task Created successfully!");
+
+        delay(500);
+
+          Serial.printf("  - Free heap after all tasks: %u bytes\n",
                         esp_get_free_heap_size());
 
-            Serial.printf("  - Minimum free heap after task: %u bytes\n",
+          Serial.printf("  - Minimum free heap after all tasks: %u bytes\n",
                         esp_get_minimum_free_heap_size());
 
-            Serial.printf("  - Largest free block after task: %u bytes\n",
+          Serial.printf("  - Largest free block after all tasks: %u bytes\n",
                         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        }
+        
 
           //That ensures deep sleep never accidentally runs scheduler creation code.
     // SUCCESSFUL End of setup with enuf batt power
 
-    pinMode(ota_button, INPUT_PULLUP);
-    buzzer.beep(2, 50, 50); 
+     buzzer.beep(2, 50, 50); 
 
     }  // else if(current_power == POWER_LOW || current_power == POWER_MODERATE || current_power == POWER_EXCELLENT)
 
@@ -426,16 +499,110 @@ void setup(){    // The principle: nothing that draws current should run until c
 
 
 
+void log_boot_to_flash() {
+    if (!LittleFS.begin(true)) return;  // true = format if mount fails
+
+    // Read reset reason
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char* reason_str;
+    switch (reason) {
+        case ESP_RST_POWERON:  reason_str = "POWERON";   break;
+        case ESP_RST_SW:       reason_str = "SOFTWARE";  break;
+        case ESP_RST_PANIC:    reason_str = "PANIC";     break;
+        case ESP_RST_INT_WDT:  reason_str = "INT_WDT";   break;
+        case ESP_RST_TASK_WDT: reason_str = "TASK_WDT";  break;
+        case ESP_RST_WDT:      reason_str = "WDT";       break;
+        case ESP_RST_BROWNOUT: reason_str = "BROWNOUT";  break;
+        default:               reason_str = "UNKNOWN";   break;
+    }
+
+    // Rotate if file exceeds 50 KB
+    if (LittleFS.exists("/health.log")) {
+        File f = LittleFS.open("/health.log", "r");
+        if (f && f.size() > 51200) {
+            f.close();
+            LittleFS.remove("/health.log.bak");
+            LittleFS.rename("/health.log", "/health.log.bak");
+        } else if (f) f.close();
+    }
+
+    File log = LittleFS.open("/health.log", "a");  // append
+    if (!log) return;
+
+    char entry[200];
+    snprintf(entry, sizeof(entry),
+             "{\"t\":\"boot\",\"reason\":\"%s\",\"heap\":%u,\"uptime\":0}\n",
+             reason_str, ESP.getFreeHeap());
+    log.print(entry);
+    log.close();
+
+    // If it was a crash reset, print the log to Serial so you see it immediately
+    if (reason != ESP_RST_POWERON && reason != ESP_RST_SW) {
+        Serial.printf("[BOOT] Reset reason: %s — reading crash log:\n", reason_str);
+        File prev = LittleFS.open("/health.log", "r");
+        while (prev.available()) Serial.write(prev.read());
+        prev.close();
+    }
+}
+
+
+// Globals (keep these, used for transmission)
+float    heap_fragmentation = 0.0f;
+float largest_contiguous = 0.0;
+float min_free_heap      = 0.0;
+float free_heap          = 0.0;
+
+char heap_report[256] = "..";
+char btn_watermark_char[100];
+char ota_watermark_str[100];
+char buzzing_watermark_char[100];
+char sensing_watermark_char[128];  // slightly wider than others — longer label
+
+// Watermark globals — written by each task, read by transmit logic
+volatile uint32_t wm_buzzing_bytes  = 0;
+volatile uint32_t wm_ota_btn_bytes  = 0;
+volatile uint32_t wm_ota_svc_bytes  = 0;
+volatile uint32_t wm_sensing_bytes  = 0; 
+
+// Round counters — start at 1 to skip round-0 cold read
+uint32_t buzzing_round     = 1;
+uint32_t buttoning_round   = 1;
+uint32_t ota_service_round = 1;
+
+
 void BuzzingTask(void * pvParams) { 
+    
   uint8_t checkin_frequency = 10; 
+  const uint32_t memory_check_interval = (5UL*60UL*100UL);
   const TickType_t xDelay = pdMS_TO_TICKS(checkin_frequency);
+  
   while (true) {
     buzzer.update();
+
+      if(buzzing_round % memory_check_interval == 0){  // every ~5min at 10ms/tick
+            UBaseType_t wm   = uxTaskGetStackHighWaterMark(NULL);
+            uint32_t wm_b    = wm * sizeof(StackType_t);
+            uint32_t used    = BUZZING_TASK_STACK_SIZE - wm_b;
+            uint32_t percent = (used * 100) / BUZZING_TASK_STACK_SIZE;
+
+            wm_buzzing_bytes = wm_b;  // write global for transmission
+
+            snprintf(buzzing_watermark_char, sizeof(buzzing_watermark_char),
+                "[BUZZ] WM: %.1fkB free | used %u/%u bytes (%u%%)",
+                wm_b / 1024.0f, used, BUZZING_TASK_STACK_SIZE, percent);
+
+            Serial.println(buzzing_watermark_char);
+        }
+
+    buzzing_round++;
     vTaskDelay(xDelay); // yield to la skedula
     //esp_task_wdt_reset();  
 
   }
 }
+
+
+
 
 void OtaButtonTask(void *pvParameters){
 
@@ -444,7 +611,15 @@ void OtaButtonTask(void *pvParameters){
 
     uint64_t pressStart = 0;
 
+    const uint32_t button_mem_interval = (5UL*60UL*10UL);
+
     while(true){
+
+         if (otaModeActive) {
+            vTaskSuspend(NULL);  // Suspend this task
+            // Will resume when OTA is done
+            continue;
+        }
     
         bool state = digitalRead(ota_button);
 
@@ -477,13 +652,28 @@ void OtaButtonTask(void *pvParameters){
 
         lastState = state;
 
-        // sleep 100ms
+          if(buttoning_round % button_mem_interval == 0){  // every ~5mins at 100ms/tick
+            UBaseType_t wm = uxTaskGetStackHighWaterMark(NULL);
+            uint32_t    wm_b = wm * sizeof(StackType_t);
+
+            wm_ota_btn_bytes = wm_b;  // write global for transmission
+
+            snprintf(btn_watermark_char, sizeof(btn_watermark_char),
+                "[OTA_BTN] WM: %.1fkB free | stack=%u bytes",
+                wm_b / 1024.0f, OTA_BTN_STACK_SIZE);
+
+            Serial.println(btn_watermark_char);
+        }
+
+        buttoning_round++;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
+
+
 void OtaServiceTask(void *pv){
-    UBaseType_t ota_watermark =  uxTaskGetStackHighWaterMark(NULL);
+    
 
     while(true){
     
@@ -503,18 +693,24 @@ void OtaServiceTask(void *pv){
             }
 
             
-
-            
-            // small delay during OTA
+            // small delay during OTA, no print or snprintf
             vTaskDelay(pdMS_TO_TICKS(10)); // VERY IMPORTANT:
         }
         else
         {   
-            
-            Serial.printf("OTA Task Stack High Water: %u bytes\n", ota_watermark * sizeof(StackType_t));
+             UBaseType_t wm   = uxTaskGetStackHighWaterMark(NULL);
+            uint32_t    wm_b = wm * sizeof(StackType_t);
 
-            // just sleep when inactive
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            wm_ota_svc_bytes = wm_b;  // write global for transmission
+
+            snprintf(ota_watermark_str, sizeof(ota_watermark_str),
+                "[OTA_SVC] WM: %.1fkB free | stack=%u bytes",
+                wm_b / 1024.0f, OTA_TASK_STACK_SIZE);
+
+            Serial.println(ota_watermark_str);
+
+            ota_service_round++;
+            vTaskDelay(pdMS_TO_TICKS(30000)); // sleep for half a minute when idle
             
         }
     }
@@ -523,15 +719,9 @@ void OtaServiceTask(void *pv){
 
 //modify sleep modes according to available battery power
 void Read_display_send_task(void *pvParams) { // the 4 in one
-
-
-   // Get initial stack high water mark
-    UBaseType_t initial_watermark = uxTaskGetStackHighWaterMark(NULL);
-    Serial.printf("[Stack] Initial high water: %u bytes\n", initial_watermark);
-    
     uint32_t packets_sent = sends;
-    uint32_t last_print = 0;
-
+    uint32_t sensing_round = 1;  // counts loop iterations for watermark cadence
+  
 
   const TickType_t return_to_task = pdMS_TO_TICKS(dynamic_interval); // dynamic interval: 3600ULL * 1000ULL / 900ULL * 1000ULL   each 15 mins or each hour when in deep sleep
   TickType_t xLastWake = xTaskGetTickCount();
@@ -545,7 +735,7 @@ void Read_display_send_task(void *pvParams) { // the 4 in one
         }
 
             esp_task_wdt_reset();  
-            Serial.println("Measuring the battery before turining on sensor...");
+           // Serial.println("Measuring the battery before turning on sensor...");
 
             MonitorBattery(); // measure voltage before sensor is powered
             voltage_before =  batt.getVoltage();
@@ -555,7 +745,7 @@ void Read_display_send_task(void *pvParams) { // the 4 in one
             sensor.toggle_sensor(ON);
             delay(50); // give the battery time to settle
 
-            Serial.println("Measuring the battery after turning ON sensor...");
+           // Serial.println("Measuring the battery after turning ON sensor...");
 
             MonitorBattery(); // measure voltage after sensor is powered
             voltage_during = batt.getVoltage();
@@ -567,7 +757,7 @@ void Read_display_send_task(void *pvParams) { // the 4 in one
             sensor.toggle_sensor(OFF);
 
             delay(100);
-            Serial.println("Measuring the battery after turning OFF sensor...");
+           // Serial.println("Measuring the battery after turning OFF sensor...");
             MonitorBattery(); // measure voltage after sensor is powered
             float voltage_after = batt.getVoltage();
 
@@ -601,32 +791,299 @@ void Read_display_send_task(void *pvParams) { // the 4 in one
             
             update_display();
 
-            // Check stack usage every 10 packets
-            if (packets_sent % 10 == 0) {
-                UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-                uint32_t used = SENSING_TASK_STACK_SIZE - watermark;
-                uint32_t percent = (used * 100) / SENSING_TASK_STACK_SIZE;
-                
-                Serial.printf("[Stack] After %lu packets: Used %u/%u bytes (%u%%)\n",
-                             packets_sent, used, SENSING_TASK_STACK_SIZE, percent);
-                last_print = packets_sent;
-                 Serial.printf("SHW => Stack high water mark: %u bytes\n", (watermark * sizeof(StackType_t)));
-            
-            // If this gets close to 0, increase stack size!
-            if(watermark < MIN_STACK_SAFETY_MARGIN) { // Less than 200 bytes remaining
-                Serial.println("WARNING: Stack nearly exhausted!");
-            }
-            // Optional: Print task stats
-            Serial.printf("Sensor task ran at %llu, free heap: %dkB\n", now_now_ms, esp_get_free_heap_size()/1024);
-    
-            }
-                         
            
+
+        // === STACK WATERMARK — every 10 iterations ===
+                if(sensing_round % 10 == 0){
+                    UBaseType_t wm   = uxTaskGetStackHighWaterMark(NULL);
+                    uint32_t wm_b    = wm * sizeof(StackType_t);         // free bytes remaining
+                    uint32_t used    = SENSING_TASK_STACK_SIZE - wm_b;   // bytes consumed
+                    uint32_t percent = (used * 100) / SENSING_TASK_STACK_SIZE;
+
+                    wm_sensing_bytes = wm_b;  // write global for transmission
+
+                    snprintf(sensing_watermark_char, sizeof(sensing_watermark_char),
+                        "[SENSE] WM: %.1fkB free | used %.1fkB/%.1fkB (%u%%)",
+                        wm_b             / 1024.0f,
+                        used             / 1024.0f,
+                        SENSING_TASK_STACK_SIZE / 1024.0f,
+                        percent);
+
+                    Serial.println(sensing_watermark_char);
+
+                    // --- Safety margin checks ---
+                    if(wm_b <= CRITICAL_STACK_SAFETY_MARGIN){
+                        Serial.printf("[SENSE] !! CRITICAL: only %u bytes stack remaining !!\n", wm_b);
+                        buzzer.alertBeep();  // audible warning — you're about to overflow
+                    } else if(wm_b <= MIN_STACK_SAFETY_MARGIN){
+                        Serial.printf("[SENSE] ! WARNING: stack low, %u bytes remaining\n", wm_b);
+                    }
+                }
+
+                sensing_round++;
+            
+             
             sleep_dynamically(current_power);   // vTaskDelayUntil(&xLastWake, return_to_task); 
   }
 
 }
 
+
+/*
+╔══════════════ SYSTEM SNAPSHOT ══════════════╗
+║ Uptime: 342 s    Free Heap: 154436 B        ║
+║ MaxBlk: 102388 B  MinEver: 150616 B         ║
+║ Fragmentation: 3.2%                         ║
+╠══════════╦═══════╦══════╦═══════╦═══════════╣
+║ Task     ║ Core  ║ St   ║ HWM W ║ HWM B     ║
+╠══════════╬═══════╬══════╬═══════╬═══════════╣
+║ loop     ║  C1   ║  R   ║  1823 ║  7292 B   ║
+║ display  ║  C0   ║  B   ║   412 ║  1648 B   ║
+║ uart     ║  C0   ║  B   ║   890 ║  3560 B   ║
+║ touch    ║  C1   ║  B   ║   310 ║  1240 B   ║
+║ audio    ║  C0   ║  R   ║   156 ║   624 B   ║
+╚══════════╩═══════╩══════╩═══════╩═══════════╝
+*/
+
+void printSystemSnapshot() {
+    Serial.println("\n╔══════════════ SYSTEM SNAPSHOT ══════════════╗");
+    Serial.printf( "║ Uptime: %lu s    Free Heap: %u B             ║\n",
+                   esp_timer_get_time()/1000000ULL,
+                   ESP.getFreeHeap());
+    Serial.printf( "║ MaxBlk: %u B     MinEver: %u B              ║\n",
+                   ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+
+    float frag = 100.0f - 
+        (100.0f * heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) 
+               / heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    Serial.printf( "║ Fragmentation: %.1f%%                         ║\n", frag);
+    Serial.println("╠══════════╦═══════╦══════╦═══════╦═══════════╣");
+    Serial.println("║ Task     ║ Core  ║ St   ║ HWM W ║ HWM B     ║");
+    Serial.println("╠══════════╬═══════╬══════╬═══════╬═══════════╣");
+
+    // Helper lambda (C++11, works in Arduino/ESP-IDF)
+    auto printTaskRow = [](const char* name, TaskHandle_t h) {
+        if (!h) {
+            Serial.printf("║ %-8s ║  ---  ║  --  ║  ----  ║   ----    ║\n", name);
+            return;
+        }
+        char core  = (xTaskGetAffinity(h) == 0) ? '0' :
+                     (xTaskGetAffinity(h) == 1) ? '1' : 'A';
+        char state = '?';
+        switch (eTaskGetState(h)) {
+            case eRunning: case eReady: state = 'R'; break;
+            case eBlocked:              state = 'B'; break;
+            case eSuspended:            state = 'S'; break;
+            case eDeleted:              state = 'D'; break;
+            default: break;
+        }
+        uint32_t hwm = uxTaskGetStackHighWaterMark(h);
+        const char* warn = (hwm < 128) ? " !!" : "   ";
+        Serial.printf("║ %-8s ║   C%c  ║   %c  ║  %4u  ║ %5u B%s ║\n",
+                      name, core, state, hwm, hwm*4, warn);
+    };
+
+    // "loop" task = currently running task
+    printTaskRow("loop",    xTaskGetCurrentTaskHandle());
+    printTaskRow("BUZZING", buzzingTaskHandle);
+    printTaskRow("OTA SERVICE",    otaTaskHandle);
+    printTaskRow("OTA BTN",   otaBtnHandle);
+    printTaskRow("SENSING",   sensingTaskHandle);
+    //printTaskRow("packets", packetTaskHandle); // add if you expose it
+
+    Serial.println("╚══════════╩═══════╩══════╩═══════╩═══════════╝");
+}
+
+
+//heap_caps_get_free_size(MALLOC_CAP_8BIT)
+//heap_caps_get_free_size(MALLOC_CAP_DMA)
+//heap_caps_get_largest_free_block(...)
+
+/*
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t minHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+*/
+void MemoryMonitorTask(void *pv){
+    uint32_t minHeapSeen = UINT32_MAX;
+
+    while(true){
+        free_heap          = (float)esp_get_free_heap_size();
+        min_free_heap      = (float)esp_get_minimum_free_heap_size();
+        largest_contiguous = (float)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        heap_fragmentation = (free_heap > 0) ? (100.0f - ((largest_contiguous * 100.0f) / free_heap)) : 0.0f;
+
+        bool newMin = (min_free_heap < minHeapSeen);
+        if(newMin) minHeapSeen = min_free_heap;
+
+        snprintf(heap_report, sizeof(heap_report), 
+            "[MEM]%s free=%.1fkB min=%.1fkB largest=%.1fkB frag=%.1f%%\n",
+            newMin ? "(!)" : "   ",
+            free_heap          / 1024.0f,
+            min_free_heap      / 1024.0f,
+            largest_contiguous / 1024.0f,
+            heap_fragmentation
+        );
+
+        Serial.println(heap_report);
+
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
+
+// {"T":"MEM","FR":150.4,"MN":150.0,"LB":108.0,"FG":28.2,"BZ":2.4,"BT":2.4,"OT":6.4,"SN":6.5}
+
+bool send_memory_report() {
+
+    // Build compact report — every byte counts, 247 max
+    // Format: MEM:free/min/largest/frag% | BZ:wm | BTN:wm | OTA:wm | SNS:wm
+    snprintf(memObj.sendable_memo, sizeof(memObj.sendable_memo),
+        "{\"T\":\"MEM\","
+        "\"FREE\":%.1f,\"MN\":%.1f,\"LARGST\":%.1f,\"FRAG\":%.1f,"
+        "\"BUZZ\":%.1f,\"OTABTN\":%.1f,\"OTA\":%.1f,\"SENSN\":%.1f}",
+        free_heap          / 1024.0f,
+        min_free_heap      / 1024.0f,
+        largest_contiguous / 1024.0f,
+        heap_fragmentation,
+        wm_buzzing_bytes   / 1024.0f,
+        wm_ota_btn_bytes   / 1024.0f,
+        wm_ota_svc_bytes   / 1024.0f,
+        wm_sensing_bytes   / 1024.0f
+    );
+
+    size_t len = strlen(memObj.sendable_memo);
+
+    // Guard — should never exceed 247 with this format (~120 bytes typical)
+    if(len == 0 || len > 247){
+        Serial.printf("[MEM_SEND] Skipped — bad length: %zu\n", len);
+        return false;
+    }
+
+    Serial.printf("[MEM_SEND] Sending memory report (%zu bytes): %s\n",
+        len, memObj.sendable_memo);
+
+    successfully_delivered = false;
+
+    esp_err_t result = esp_now_send(
+        System.peer.broadcastAddress,
+        (uint8_t*)memObj.sendable_memo,
+        len
+    );
+
+    if(result == ESP_OK){
+        Serial.println("[MEM_SEND] Memory report sent!");
+        return true;
+    } else {
+        Serial.println("[MEM_SEND] Memory report send failed!");
+        return false;
+    }
+}
+
+
+/*
+void printCpuLoad() {
+
+    uint32_t idle0 = xTaskGetIdleRunTimeCounter();
+    uint32_t idle1 = xTaskGetIdleRunTimeCounter();
+
+    Serial.printf(
+        "[CPU] idle0:%u  idle1:%u\n",
+        idle0 - lastIdle0,
+        idle1 - lastIdle1
+    );
+
+    lastIdle0 = idle0;
+    lastIdle1 = idle1;
+}
+
+// This helps detect problems like: runaway loops, blocking code, starvation
+void logHealth() {
+
+    File f = LittleFS.open("/system_health.log", "a");
+
+    if (!f) return;
+
+    f.printf(
+        "%lu free:%u largest:%u min:%u\n",
+        millis(),
+        heap_caps_get_free_size(MALLOC_CAP_8BIT),
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)
+    );
+
+    f.close();
+}
+
+*/
+
+
+
+/*
+
+uint32_t freeHeap = 0;
+uint32_t minHeap = 0;
+uint32_t largest = 0;
+uint32_t frag  = 0;
+
+
+float heap_fragmentation = 0.0f;
+uint32_t largest_contiguous = 0;
+uint32_t min_free_heap = 0;
+
+// present in kB
+void MemoryMonitorTask(void *pv){
+
+    uint32_t minHeapSeen = UINT32_MAX;
+
+    while(true){
+      
+         freeHeap = esp_get_free_heap_size();
+         minHeap  = esp_get_minimum_free_heap_size();
+         largest  = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+         frag     = (freeHeap > 0) ? (100 - ((largest * 100) / freeHeap)) : 0;
+
+        // Track new minimums separately
+        bool newMin = (minHeap < minHeapSeen);
+        if(newMin) minHeapSeen = minHeap;
+
+        // Always print, flag when it's a new worst case
+        Serial.printf("[MEM]%s free=%u min=%u largest=%u frag=%u%%\n",
+            newMin ? "(!)" : "   ",   // "(!)" draws your eye in the log
+            freeHeap, minHeap, largest, frag
+        );
+
+        
+            heap_fragmentation =  (float)(100 - (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) * 100 / esp_get_free_heap_size()));
+            largest_contiguous =  heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            min_free_heap = esp_get_minimum_free_heap_size();
+           // if(ota_service_round%100)
+                 
+                 Serial.printf("[MEM] Heap free: %u | Min ever: %u | Largest block: %u | Frag: %.2f%%\n",
+                    esp_get_free_heap_size(),
+                    min_free_heap,
+                    largest_contiguous,
+                    heap_fragmentation
+                   );
+
+        vTaskDelay(pdMS_TO_TICKS(60000)); // each minute
+    }
+}
+
+*/
+
+void update_reset_tracking() { 
+    boot_count++;
+    esp_reset_reason_t reason = esp_reset_reason();
+    if (reason != last_reset_reason) {
+        reset_count++;
+        last_reset_reason = reason;
+        last_reset_time_us = esp_timer_get_time();
+        // Don't try to use sawa here - it's not ready yet
+        snprintf(last_reset_time_str, sizeof(last_reset_time_str), 
+                 "us:%llu", last_reset_time_us);
+    }
+}
 
 
 
@@ -686,7 +1143,7 @@ void toggle_ota() {
     }
     
      Serial.println("\n=== OTA Triggered ===");
-     buzzer.beep(1, 300, 0);
+     buzzer.beep(1, 1000, 0);
     
     esp_err_t result = esp_now_deinit();
     if (result != ESP_OK) {
@@ -718,7 +1175,7 @@ void toggle_ota() {
  
     
     Serial.println("\n=== OTA Mode Activated ===");
-    buzzer.beep(1, 1000, 0); // now active
+    buzzer.beep(3, 50, 50); // now active
     
     // Update display to show OTA screen
     currentScreen = 10;
@@ -730,7 +1187,7 @@ void process_ota_state_transitions(uint64_t running_time) {
     // Handle OTA started state
     if (otaStarted) {
         strcpy(ota_log, "Starting OTA update...");
-        buzzer.beep(2, 300, 200);
+       // buzzer.beep(2, 300, 200);
         ota_start_time = running_time;
         otaStarted = false;
         current_ota_state = OTA_STATE_STARTING;
@@ -745,7 +1202,7 @@ void process_ota_state_transitions(uint64_t running_time) {
     // Handle OTA finished state
     if (otaFinished) {
         strcpy(ota_log, "Update complete!");
-        buzzer.beep(2, 500, 200);
+        buzzer.beep(2, 500, 500);
         otaFinished = false;
         current_ota_state = OTA_STATE_SUCCESS;
         ota_success_time = running_time;
@@ -754,7 +1211,7 @@ void process_ota_state_transitions(uint64_t running_time) {
     // Handle OTA error state
     if (otaError) {
         strcpy(ota_log, "Update failed!");
-        buzzer.beep(1, 500, 500);
+        buzzer.beep(1, 2000, 0);
         otaError = false;
         current_ota_state = OTA_STATE_ERROR;
         ota_error_time = running_time;
@@ -823,7 +1280,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status){
         
         Serial.printf("✅ Delivered to %s (total: %d)\n", macStr, sends);
     } else {
-        successfully_delivered = false;
+       // successfully_delivered = false;
         Serial.println("❌ Delivery failed");
         // When a critical error occurs:
         //if (fatal_error) {
@@ -846,6 +1303,9 @@ bool send_with_retry() {
                 delay(1); // hang in here for 100 millisecs
             }
             if (successfully_delivered) return true;
+            delay(500);
+            send_memory_report();
+            //Serial.println("Memory Report Sent!");
         }
         delay(random(50, 200)); // Exponential backoff
     }
@@ -870,9 +1330,9 @@ bool serialize_to_JSON() {
     JSON_data["DUR"] =   sensor.readings_duration;
    // JSON_data["MEAN"] = sensor.mean;
    // JSON_data["VAR"] = sensor.variance; //to be computed by receiver
-    JSON_data["DEV"] = sensor.stddev; 
-    JSON_data["MEDIAN"] = sensor.median;
-    JSON_data["RANGE"] = sensor.range;
+    JSON_data["DEV"] = round2(sensor.stddev); 
+    JSON_data["MEDIAN"] = round2(sensor.median);
+    JSON_data["RANGE"] = round2(sensor.range);
     JSON_data["MOI"] = sensor.soilPercent;
 
     JSON_data["VOLT"] = batt.getVoltage(); // float e.g 4.21
@@ -889,9 +1349,11 @@ bool serialize_to_JSON() {
     // Calculate size BEFORE adding PKT
     size_t estimated_size = measureJson(JSON_data);  // Better than serializing first
     
-    if (estimated_size >= sizeof(senderObj.sendable_data_bundle)) {
+    if (estimated_size >= sizeof(senderObj.sendable_data_pack)) {
         Serial.printf("Buffer overflow! Need %zu bytes, have %u\n", 
-                      estimated_size, sizeof(senderObj.sendable_data_bundle));
+                      estimated_size, sizeof(senderObj.sendable_data_pack));
+        // oversize beep
+        // break into 2 chunks
         return false;
     }
     
@@ -899,7 +1361,7 @@ bool serialize_to_JSON() {
     //JSON_data["PKT"] = estimated_size;  // Or final size after adding PKT
     
     // Single serialization
-    size_t written = serializeJson(JSON_data, senderObj.sendable_data_bundle);
+    size_t written = serializeJson(JSON_data, senderObj.sendable_data_pack);
     
     if (written == 0) {
         return false;
@@ -928,7 +1390,7 @@ bool send_d_JSON() { // bundle of JOY ... limit to ~ 150bytes and AVOID PARSING 
     }
     
     // CRITICAL FIX: Get the JSON string length (NOT sizeof struct!)
-    size_t payload_len = strlen(senderObj.sendable_data_bundle);
+    size_t payload_len = strlen(senderObj.sendable_data_pack);
     
     // Safety check
     if (payload_len == 0) {
@@ -945,11 +1407,12 @@ bool send_d_JSON() { // bundle of JOY ... limit to ~ 150bytes and AVOID PARSING 
     
     // Copy to local buffer while protected (optional but safer)
     char local_buf[250];
-    memcpy(local_buf, senderObj.sendable_data_bundle, payload_len + 1);
+    memcpy(local_buf, senderObj.sendable_data_pack, payload_len + 1);
     
     // Release mutex BEFORE sending (send doesn't need protection)
     xSemaphoreGive(xDataMutex);
     
+    successfully_delivered = false;
     // Send to both receivers - USING JSON STRING, NOT STRUCT!
     esp_err_t result1 = esp_now_send(System.peer.broadcastAddress, 
                                      (uint8_t*)local_buf, 
@@ -974,6 +1437,7 @@ bool send_d_JSON() { // bundle of JOY ... limit to ~ 150bytes and AVOID PARSING 
     }
 }
 
+// momory struct
 
 // Enhanced flash function with pattern reset capability
 void flash(uint64_t flash_time, uint8_t heartbeat,
@@ -1092,7 +1556,7 @@ bool read_button(uint8_t pin, uint64_t time_now) {
     {
         pressed = true;
         btn->longPressHandled = true;
-        buzzer.beep(1, 50, 0);
+       // buzzer.beep(1, 50, 0);
         
         // Optional: Add pin-specific debug
         Serial.print("Button on pin ");
@@ -1178,7 +1642,7 @@ bool switch_radio_to_wifi(){
  //  snprintf(wifi_log, sizeof(wifi_log), " WiFi channel: %d\n", WiFi.channel());
 
   //Serial.println(wifi_log);
-    unsigned long startTime = now_now_ms;
+    unsigned long startTime = esp_timer_get_time()/1000ULL;
 
   // Initialize WiFi with timeout protection
   bool wifiSuccess = false;
@@ -1186,7 +1650,7 @@ bool switch_radio_to_wifi(){
   /*              WiFi.begin(System.OverTheAir.ssid, System.OverTheAir.password);
   */
  
-    while (now_now_ms - startTime < WIFI_SWITCH_TIMEOUT_MS) {
+    while ((esp_timer_get_time()/1000ULL - startTime) < WIFI_SWITCH_TIMEOUT_MS) {
         if (wifi_obj.initialize_ESP_WiFi(SensorID) == WIFI_MGR_SUCCESS) {
             wifiSuccess = true;
             break;
@@ -1242,19 +1706,113 @@ bool switch_radio_to_wifi(){
   return false;
 }
 
+bool first_entry = true;
 
-bool switch_radio_to_espnow(){
+bool switch_radio_to_espnow() {
 
-   // 1. Always start from a clean state
-    esp_now_deinit();        // safe if not initialized
+    // ── GUARD: catch null peer address before touching radio hardware ─────
+    if (System.peer.broadcastAddress == nullptr) {
+        Serial.println("[ESPNOW] FATAL: broadcastAddress is NULL — System.peer not initialized");
+        return false;
+    }
+    // Optional: sanity-check it's not all zeros (unconfigured)
+    bool all_zero = true;
+    for (int i = 0; i < 6; i++) {
+        if (System.peer.broadcastAddress[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) {
+        Serial.println("[ESPNOW] FATAL: broadcastAddress is all zeros — check System.peer config");
+        return false;
+    }
+    Serial.printf("[ESPNOW] Peer MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        System.peer.broadcastAddress[0], System.peer.broadcastAddress[1],
+        System.peer.broadcastAddress[2], System.peer.broadcastAddress[3],
+        System.peer.broadcastAddress[4], System.peer.broadcastAddress[5]);
+
+    // ── 1. Teardown ───────────────────────────────────────────────────────
+    if (esp_now_initialized) {
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
+        esp_now_initialized = false;
+    }
+    can_send_over_espnow = false;
+
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(100);
 
+    // ── 2. Radio up ───────────────────────────────────────────────────────
+    WiFi.mode(WIFI_STA);
+    delay(100);
+
+    if (esp_wifi_start() != ESP_OK) {
+        Serial.println("[ESPNOW] Failed to start WiFi radio");
+        return false;
+    }
+    Serial.println("[ESPNOW] WiFi radio started");
+
+    // ── 3. Init + peer registration with retry ────────────────────────────
+    for (uint8_t attempt = 1; attempt <= ESPNOW_MAX_RETRIES; attempt++) {
+
+        if (esp_now_init() != ESP_OK) {
+            Serial.printf("[ESPNOW] esp_now_init failed (attempt %d/%d)\n",
+                          attempt, ESPNOW_MAX_RETRIES);
+            delay(100 * attempt);
+            continue;
+        }
+
+        esp_now_initialized = true;
+        Serial.printf("[ESPNOW] Initialized (attempt %d/%d)\n",
+                      attempt, ESPNOW_MAX_RETRIES);
+
+        // Register callback BEFORE adding peer
+        esp_now_register_send_cb(OnDataSent);
+
+        // Zero struct first — prevents stale padding bytes causing alignment faults
+        memset(&peerInfo, 0, sizeof(peerInfo));
+        memcpy(peerInfo.peer_addr, System.peer.broadcastAddress, 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+
+        esp_now_del_peer(peerInfo.peer_addr); // safe if not present
+
+        if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+            Serial.println("[ESPNOW] Peer registered successfully");
+            can_send_over_espnow = true;
+            return true;
+        }
+
+        // Peer add failed — full teardown before retry
+        Serial.printf("[ESPNOW] Peer add failed (attempt %d/%d)\n",
+                      attempt, ESPNOW_MAX_RETRIES);
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
+        esp_now_initialized = false;
+        delay(100 * attempt);
+    }
+
+    Serial.println("[ESPNOW] All retries exhausted");
+    return false;
+}
+
+
+/*
+bool switch_radio_to_espnow(){
+    // 1. Always start from a clean state
+
+    if(first_entry){
+        Serial.println("Deinitializing ESPNOW");
+        esp_now_deinit();        // safe if not initialized
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(100);
+        first_entry = false;
+    }
+
     WiFi.mode(WIFI_STA);
     delay(100);              // let the radio settle in STA mode
 
-    /*
+    
     // First, check if radio is still functional
     if(!is_radio_hardware_ok()) {
         Serial.println("Radio hardware unresponsive - forcing full reset");
@@ -1268,30 +1826,31 @@ bool switch_radio_to_espnow(){
         delay(500);
     }
 
-    */
+    
 
-    /*
+    
      static bool last_state = false; // check if radio was still on during sleep.
     
     if (last_state == can_send_over_espnow && can_send_over_espnow) {
         return true;  // Already initialized
     }
-    */
+    
 
 
         // Explicitly start WiFi
     if(esp_wifi_start() != ESP_OK) {
         Serial.println("Failed to start WiFi");
        // last_state = false;
-        return false;
+        can_send_over_espnow =  false;
     }
+    else Serial.println("ESP_WIFI STARTED!");
     /*
     // Wait for WiFi to be ready
     int attempts = 0;
     while(WiFi.status() == WL_NO_SHIELD && attempts++ < 20) {
         delay(50);
     }
-    */
+    
     
     
     // ESP-NOW initialization with retry logic
@@ -1311,24 +1870,18 @@ bool switch_radio_to_espnow(){
             if (esp_now_add_peer(&peerInfo) == ESP_OK) {
                 Serial.println("✓ Peer registered successfully");
                 can_send_over_espnow = true;
-                return true;
+               // return true;
             }
             
             esp_now_register_send_cb(OnDataSent);
             
 
-            /*
-                memcpy(peerInfo.peer_addr, System.peer.broadcastAddress2, 6);
-                peerInfo.channel = 0;
-                peerInfo.encrypt = false;
-            
-            */
             
             if (esp_now_add_peer(&peerInfo) == ESP_OK) {
                 Serial.println("✓ Peer registered successfully");
                 can_send_over_espnow = true;
                // last_state = true;
-                return true;
+              //  return true;
             } 
             else { can_send_over_espnow = false;
                      Serial.println("!!! Peer registration failed");
@@ -1347,9 +1900,9 @@ bool switch_radio_to_espnow(){
     
     Serial.println("!!! ESP-NOW initialization failed after retries");
    // last_state = false;
-    return false;
+    return can_send_over_espnow;
 }
-
+*/
 uint8_t radio_failure_count = 0;
 
 void toggle_radio(bool state){
@@ -1854,7 +2407,11 @@ void Power_Wifi_Screen() {
 
 void drawLargeBatteryIcon(int x, int y, float voltage) {
     // Normalize fill between 7.4V (empty) and 8.4V (full)
-    float fill = constrain((voltage - 7.4f) / (8.4f - 7.4f), 0.0f, 1.0f);
+    // single_cell_max_voltage = 4.2
+    // single_cell_max_voltage - 0.5 = 3.7
+     empty = (single_cell_max_voltage - 0.5);
+
+     fill = constrain((voltage - empty) / (single_cell_max_voltage - empty), 0.0f, 1.0f);
 
     // Outer shell (88×40) with rounded corners
     LCD.fillRoundRect(x, y, 88, 40, 5, GxEPD_BLACK);
@@ -1889,7 +2446,10 @@ void drawLargeBatteryIcon(int x, int y, float voltage) {
 }
 
 void drawBatteryIcon(int x, int y, float voltage) {
-    float fill = constrain((voltage - 7.4) / (8.4 - 7.4), 0.0, 1.0);
+     empty = (single_cell_max_voltage - 0.5);
+
+     fill = constrain((voltage - empty) / (single_cell_max_voltage - empty), 0.0f, 1.0f);
+
 
     LCD.fillRoundRect(x, y, 38, 20, 3, GxEPD_BLACK);      // outer shell
     LCD.fillRect(x + 38, y + 5, 4, 10, GxEPD_BLACK);      // positive terminal
@@ -2037,10 +2597,12 @@ void footer(){
                  
         // ==== DYNAMIC BATTERY ICON ====
           // Position: bottom-right (x=150, y=174)
-          float v = batt.getVoltage();
+          float volts = batt.getVoltage();
 
-          // Normalize 7.4V (empty) → 8.4V (full)
-          float fill = constrain((v - 7.4) / (8.4 - 7.4), 0.0, 1.0);
+           empty = (single_cell_max_voltage - 0.5);
+
+            fill = constrain((volts - empty) / (single_cell_max_voltage - empty), 0.0f, 1.0f);
+
 
           // Draw battery outline
           LCD.fillRoundRect(150, 174, 38, 20, 3, GxEPD_BLACK);  // outer shell
@@ -2058,7 +2620,7 @@ void footer(){
           LCD.setTextSize(1);
           LCD.setTextColor(GxEPD_BLACK);
           LCD.setCursor(125, 180);  // Adjusted for baseline alignment
-          LCD.printf("%.1fV", v);
+          LCD.printf("%.1fV", volts);
 
       /*
             LCD.fillRoundRect(150, 174, 38, 20, 3, GxEPD_BLACK); LCD.fillRoundRect(154, 178, 30, 12, 3, GxEPD_WHITE); LCD.fillRect(146, 179, 5, 10, GxEPD_BLACK);  
